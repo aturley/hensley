@@ -14,6 +14,8 @@ use "lib:hensley"
 use @py_obj_decref[None](o: PyObjP tag)
 use @py_obj_incref[None](o: PyObjP tag)
 use @py_obj_is_none[I64](o: PyObjP tag)
+use @py_string_check[I64](py_obj: PyObjP)
+use @py_none[PyObjP]()
 
 use @Py_Initialize[None]()
 use @Py_Finalize[None]()
@@ -58,11 +60,16 @@ use @PyInt_AsLong[I64](o: PyObjP)
 type PyObjP is Pointer[U8] tag
 type PyGILState is Pointer[U8] tag
 
-primitive PyErrorFactory
-  fun apply(): PyError =>
+
+primitive PyObjectOrError
+  fun apply(o: PyObjP): (PyObject | PyError) =>
     var e_type: PyObjP = Pointer[U8]
     var e_value: PyObjP = Pointer[U8]
     var e_traceback: PyObjP = Pointer[U8]
+
+    if @PyErr_Occurred().is_null() then
+      return PyObject(o)
+    end
 
     @PyErr_Fetch(addressof e_type, addressof e_value, addressof e_traceback)
     @PyErr_Clear()
@@ -99,30 +106,50 @@ class val PyError
     line = line'
     message = message'
 
+  fun get_attr(attr: String): (PyObject box | PyError box) =>
+    this
+
+  fun call(args: Array[PyObject] val = recover Array[PyObject] end): (PyObject box | PyError box) =>
+    this
+
+  fun to_string(): String =>
+    ""
+
+  fun as_string(): (PyObject box | PyError box) =>
+    this
+
+  fun to_i64(): I64 =>
+    0
+
+  fun to_array_from_list(): Array[PyObject] val =>
+    recover Array[PyObject] end
+
+  fun to_array_from_tuple(): Array[PyObject] val =>
+    recover Array[PyObject] end
+
+  fun is_none(): Bool =>
+    false
+
+
 class val PyObject
   let _py_obj_p: PyObjP
   let _info: String
-  let _error: (None | PyError)
 
   new val create(py_obj_p: PyObjP, info: String = "") =>
-    if not @PyErr_Occurred().is_null() then
-      _error = PyErrorFactory()
-    else
-      _error = None
-    end
-
     _py_obj_p = py_obj_p
     _info = info
+
+  new val none() =>
+    _py_obj_p = @py_none()
+    _info = ""
 
   new val from_string(str: String, info: String = "") =>
     _py_obj_p = @PyString_FromString(str.cstring())
     _info = info
-    _error = None
 
   new val from_i64(i64: I64, info: String = "") =>
     _py_obj_p = @PyInt_FromLong(i64)
     _info = info
-    _error = None
 
   new val tuple_from_array(a: Array[PyObject] val, info: String = "") =>
     let size = a.size()
@@ -135,7 +162,6 @@ class val PyObject
       @PyTuple_SetItem(_py_obj_p, i, obj.ptr())
     end
     _info = info
-    _error = None
 
   new val list_from_array(a: Array[PyObject] val, info: String = "") =>
     let size = a.size()
@@ -148,16 +174,30 @@ class val PyObject
       @PyList_SetItem(_py_obj_p, i, obj.ptr())
     end
     _info = info
-    _error = None
 
-  fun get_attr(attr: String): PyObject =>
-    PyObject(@PyObject_GetAttrString(_py_obj_p, attr.cstring()), "attr")
+  fun get_attr(attr: String): (PyObject box | PyError box) =>
+    PyObjectOrError(@PyObject_GetAttrString(_py_obj_p, attr.cstring()))
 
-  fun call(args: Array[PyObject] val = recover Array[PyObject] end): PyObject =>
-    PyObject(@PyObject_Call(_py_obj_p, PyObject.tuple_from_array(args).ptr(), Pointer[U8]))
+  fun call(args: Array[PyObject] val = recover Array[PyObject] end): (PyObject box | PyError box) =>
+    PyObjectOrError(@PyObject_Call(_py_obj_p, PyObject.tuple_from_array(args).ptr(), Pointer[U8]))
 
   fun to_string(): String =>
     recover String.copy_cstring(@PyString_AsString(_py_obj_p)) end
+
+  fun as_string(fn: {(String): (PyObject box | PyError box)},
+    else_fn: ({(): (PyObject box | PyError box)} | None) = None):
+    (PyObject box | PyError box)
+  =>
+    if @py_string_check(_py_obj_p) != 0 then
+      fn(to_string())
+    else
+      match else_fn
+      | let efn: {(): (PyObject box | PyError box)} =>
+        efn()
+      else
+        this
+      end
+    end
 
   fun to_i64(): I64 =>
     @PyInt_AsLong(_py_obj_p)
@@ -181,17 +221,6 @@ class val PyObject
   fun is_none(): Bool =>
     @py_obj_is_none(_py_obj_p) != 0
 
-  fun is_error(): Bool =>
-    match _error
-    | None =>
-      false
-    else
-      true
-    end
-
-  fun get_error(): (PyError | None) =>
-    _error
-
   fun ptr(): PyObjP =>
     _py_obj_p
 
@@ -200,7 +229,6 @@ class val PyObject
 
   fun _final() =>
     @py_obj_decref(_py_obj_p)
-
 
 
 primitive Hensley
@@ -212,13 +240,19 @@ primitive Hensley
 
   fun import_module(module_name: String): PyObject =>
     let py_module_name = PyObject.from_string(module_name, "module name")
-    PyObject(@PyImport_Import(py_module_name.ptr()), "module z")
+    PyObject(@PyImport_Import(py_module_name.ptr()))
 
   fun gil_state_ensure(): PyGILState =>
     @PyGILState_Ensure()
 
   fun gil_state_release(pgs: PyGILState) =>
     @PyGILState_Release(pgs)
+
+  fun with_gil[T: Any](fn: {(): T}): T! =>
+    let pgs = gil_state_ensure()
+    let res = fn()
+    gil_state_release(pgs)
+    consume res
 
 actor Main
   new create(env: Env) =>
@@ -227,14 +261,31 @@ actor Main
     let test_module = Hensley.import_module("ponytest")
 
     let hello_world = test_module.get_attr("hello_world")
-    hello_world.call()
+    let res1 = hello_world.call()
+    match res1
+    | let e: PyError box =>
+      env.out.print("res1 should not error but did")
+      env.out.print("  res1 error: '" + e.message + "'")
+      env.out.print("  res1 file: '" + e.file_name + "' line: " + e.line.string())
+    end
 
     let hello_world2 = test_module.get_attr("hello_world2")
-    hello_world2.call(recover [PyObject.from_string("bobby")] end)
+    let res2 = hello_world2.call(recover [PyObject.from_string("bobby")] end)
+    match res2
+    | let e: PyError box =>
+      env.out.print("res2 should not error but did")
+      env.out.print("  res2 error: '" + e.message + "'")
+      env.out.print("  res2 file: '" + e.file_name + "' line: " + e.line.string())
+    end
 
     let hello_world3 = test_module.get_attr("hello_world3")
     let out3 = hello_world3.call(recover [PyObject.from_string("bobby")] end)
-    env.out.print(out3.to_string())
+    match out3
+    | let e: PyError box =>
+      env.out.print("out3 should not error but did")
+    | let o: PyObject box =>
+      env.out.print(o.to_string())
+    end
 
     let hello_world4 = test_module.get_attr("hello_world4")
     let list4 = recover iso Array[PyObject] end
@@ -244,50 +295,102 @@ actor Main
     args4.push(PyObject.list_from_array(consume list4))
     let out4 = hello_world4.call(consume args4)
     env.out.print(out4.to_string())
+    match out4
+    | let e: PyError box =>
+      env.out.print("out4 should not error but did")
+    | let o: PyObject box =>
+      env.out.print("out4: " + o.to_string())
+    end
 
     let hello_world5 = test_module.get_attr("hello_world5")
     let res5 = hello_world5.call()
-    let a5 = res5.to_array_from_list()
-    for x in a5.values() do
-      env.out.print(" - " + x.to_string())
+    match res5
+    | let o: PyObject box =>
+      let a = o.to_array_from_list()
+      for x in a.values() do
+        env.out.print("res5: - " + x.to_string())
+      end
+    else
+      env.out.print("res5: ERROR")
     end
 
     let hello_world6 = test_module.get_attr("hello_world6")
     let res6 = hello_world6.call()
-    let a6 = res6.to_array_from_tuple()
-    for x in a6.values() do
-      env.out.print(" - " + x.to_string())
+    match res6
+    | let o: PyObject box =>
+      let a6 = o.to_array_from_tuple()
+      for x in a6.values() do
+        env.out.print("res6: - " + x.to_string())
+      end
+    else
+      env.out.print("res6: ERROR")
     end
 
     let hello_world7 = test_module.get_attr("hello_world7")
     let res7 = hello_world7.call(recover [PyObject.from_i64(5)] end)
-    env.out.print(res7.to_string())
+    match res7
+    | let o: PyObject box =>
+      env.out.print("res7: " + o.to_string())
+    else
+      env.out.print("res7: ERROR")
+    end
+
 
     let hello_world8 = test_module.get_attr("hello_world8")
     let res8 = hello_world8.call()
-    env.out.print(res8.to_i64().string())
+    match res8
+    | let o: PyObject box =>
+      env.out.print("res8:" + res8.to_i64().string())
+    | let e: PyError box =>
+      env.out.print("res8: ERROR")
+      env.out.print("  res8 error: '" + e.message + "'")
+      env.out.print("  res8 file: '" + e.file_name + "' line: " + e.line.string())
+    end
 
     let hello_world9 = test_module.get_attr("hello_world9")
     let res9 = hello_world9.call()
-    env.out.print("does the world exist? it should: " + res9.is_none().string())
+    let out9 = match res9
+    | let o: PyObject box =>
+      o.is_none().string()
+    else
+      "ERROR"
+    end
+
+    env.out.print("does the world exist? it should: " + out9)
 
     let hello_world10 = test_module.get_attr("hello_world10")
     let res10 = hello_world10.call()
-    let out10 = match res10.get_error()
-    | let e: PyError =>
-      env.out.print("error: '" + e.message + "'")
-      env.out.print("file: '" + e.file_name + "' line: " + e.line.string())
+
+    match res10
+    | let e: PyError box =>
+      env.out.print("res10 error: '" + e.message + "'")
+      env.out.print("res10 file: '" + e.file_name + "' line: " + e.line.string())
     else
       env.out.print("Should have error but don't")
     end
 
-    match test_module.get_attr("hello_world11").call().get_error()
-    | let e: PyError =>
-      env.out.print("error: '" + e.message + "'")
-      env.out.print("file: '" + e.file_name + "' line: " + e.line.string())
+    match test_module.get_attr("hello_world11").call()
+    | let e: PyError box =>
+      env.out.print("11 error: '" + e.message + "'")
+      env.out.print("11 file: '" + e.file_name + "' line: " + e.line.string())
     else
-      env.out.print("Should have error but don't")
+      env.out.print("11 should have error but don't")
     end
 
     Hensley.gil_state_release(pgs)
+
+    Hensley.with_gil[None](
+      {()(hello_world): None =>
+        hello_world.call()
+      })
+
+    Hensley.with_gil[None](
+      {()(hello_world, env): None =>
+        PyObject.from_string("hello from a string").as_string(
+          {(s: String)(env) : (PyObject box | PyError box) =>
+            env.out.print(s)
+            PyObject.none()
+          })
+      })
+
     Hensley.finalize()
